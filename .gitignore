@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Personal data / credentials
+timeline.db
+timeline_config.json
+.timelinehub_creds.json
+
+# Backups
+_backup_*/
+
+# Build / misc
+*.log
+Thumbs.db
+.DS_Store
