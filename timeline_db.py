@@ -360,6 +360,38 @@ class TimelineDB:
                 (ruler_min, ruler_max, 1 if ruler_max_is_present else 0, timeline_id)
             )
 
+    def load_timeline_breaks(self, timeline_id):
+        """Return list of {id, start, end} dicts sorted by start."""
+        with sqlite3.connect(self.db_file) as conn:
+            rows = conn.execute(
+                "SELECT id, break_start, break_end FROM TimelineBreak "
+                "WHERE timeline_id=? ORDER BY break_start",
+                (timeline_id,)
+            ).fetchall()
+        return [{"id": r[0], "start": r[1], "end": r[2]} for r in rows]
+
+    def add_timeline_break(self, timeline_id, start, end):
+        """Insert a break and return its id."""
+        with sqlite3.connect(self.db_file) as conn:
+            cur = conn.execute(
+                "INSERT INTO TimelineBreak (timeline_id, break_start, break_end) VALUES (?,?,?)",
+                (timeline_id, start, end)
+            )
+            return cur.lastrowid
+
+    def delete_timeline_break(self, break_id):
+        """Remove a break by id."""
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute("DELETE FROM TimelineBreak WHERE id=?", (break_id,))
+
+    def update_timeline_break(self, break_id, start, end):
+        """Update the date range of an existing break."""
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute(
+                "UPDATE TimelineBreak SET break_start=?, break_end=? WHERE id=?",
+                (start, end, break_id)
+            )
+
     def add_timeline(self, title):
         """Insert a new timeline and return its ID."""
         with sqlite3.connect(self.db_file) as conn:
@@ -704,6 +736,16 @@ class TimelineDB:
             if "linked_timelineid" not in event_cols:
                 conn.execute("ALTER TABLE events ADD COLUMN linked_timelineid INTEGER")
 
+            # Timeline break table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS TimelineBreak (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timeline_id INTEGER REFERENCES Timeline(TimelineID),
+                    break_start REAL NOT NULL,
+                    break_end   REAL NOT NULL
+                )
+            """)
+
             # Seed "Practice Timeline" and migrate orphaned records
             tl_count = conn.execute("SELECT COUNT(*) FROM Timeline").fetchone()[0]
             if tl_count == 0:
@@ -933,6 +975,7 @@ class TimelineView:
     LABEL_TIER_H  = 16   # height per label tier when staggering overlapping titles
     TICK_H        = 20
     CANVAS_MARGIN  = 20   # px of blank space at each horizontal end
+    BREAK_STUB_PX  = 20   # pixels allocated to each break marker
     CAT_HEADER_H   = 36   # height of the category title bar row
 
     # Category colour palette (used for label strips and lane backgrounds)
@@ -1010,6 +1053,8 @@ class TimelineView:
             self.max_date = _today_value()
         elif ruler_max is not None:
             self.max_date = ruler_max
+
+        self._breaks = self.db.load_timeline_breaks(self.db.active_timeline_id)
 
         _known_cats      = {n["title"] for n in self.db.cat_nodes}
         event_cats       = {e.get("category") or "General" for e in _visible_events}
@@ -1304,7 +1349,8 @@ class TimelineView:
         self.label_canvas.pack(side=tk.LEFT, fill=tk.Y)
 
         # Main event canvas
-        self.canvas = tk.Canvas(body_frame, bg=self._canvas_bg_color, cursor="fleur")
+        self.canvas = tk.Canvas(body_frame, bg=self._canvas_bg_color, cursor="fleur",
+                                highlightthickness=0)
 
         # Horizontal scroll: ruler + event canvas move together
         def _xscroll_both(*args):
@@ -1350,10 +1396,11 @@ class TimelineView:
         # Ruler — drag pans horizontally; wheel zooms
         self.ruler_canvas.bind("<ButtonPress-1>", self._drag_start_ruler)
         self.ruler_canvas.bind("<B1-Motion>",      self._drag_move_ruler)
-        self.ruler_canvas.bind("<Motion>",         lambda e: setattr(self, "_last_mouse_x", e.x))
+        self.ruler_canvas.bind("<Motion>",         self._on_ruler_motion)
         self.ruler_canvas.bind("<MouseWheel>",     self._mouse_wheel)
         self.ruler_canvas.bind("<Button-4>",       self._mouse_wheel)
         self.ruler_canvas.bind("<Button-5>",       self._mouse_wheel)
+        self.ruler_canvas.bind("<Button-3>",       self._on_ruler_right_click)
 
         # Label column — drag scrolls vertically; wheel zooms
         self.label_canvas.bind("<ButtonPress-1>", self._drag_start_label)
@@ -2813,11 +2860,67 @@ class TimelineView:
 
     # ── coordinate helpers ────────────────────────────────────────────────────
 
+    def _compressed_offset(self, d):
+        """Pixels saved by all breaks whose start is before date d."""
+        total = 0.0
+        for b in getattr(self, '_breaks', []):
+            bs, be = b['start'], b['end']
+            span = be - bs
+            if span <= 0 or d <= bs:
+                continue
+            if d >= be:
+                total += max(0.0, span * self.px_per_year - self.BREAK_STUB_PX)
+            else:
+                # d is inside this break — compress the portion crossed
+                total += (d - bs) * self.px_per_year
+        return total
+
+    def _total_break_savings(self):
+        """Total pixels removed by all breaks."""
+        total = 0.0
+        for b in getattr(self, '_breaks', []):
+            span = b['end'] - b['start']
+            if span > 0:
+                total += max(0.0, span * self.px_per_year - self.BREAK_STUB_PX)
+        return total
+
     def _x(self, date_val):
-        return self.CANVAS_MARGIN + (date_val - self.min_date) * self.px_per_year
+        raw = self.CANVAS_MARGIN + (date_val - self.min_date) * self.px_per_year
+        return raw - self._compressed_offset(date_val)
 
     def _canvas_width(self):
-        return self.CANVAS_MARGIN + (self.max_date - self.min_date) * self.px_per_year + self.CANVAS_MARGIN
+        return (self.CANVAS_MARGIN
+                + (self.max_date - self.min_date) * self.px_per_year
+                - self._total_break_savings()
+                + self.CANVAS_MARGIN)
+
+    def _date_from_x(self, cx):
+        """Invert _x(): canvas pixel x → date value, respecting breaks."""
+        breaks = sorted(getattr(self, '_breaks', []), key=lambda b: b['start'])
+        d_cursor = self.min_date
+        for b in breaks:
+            bs, be = b['start'], b['end']
+            if bs <= d_cursor:
+                d_cursor = max(d_cursor, be)
+                continue
+            x_seg_start = self._x(d_cursor)
+            x_seg_end   = self._x(bs)
+            if cx <= x_seg_end:
+                if x_seg_end <= x_seg_start:
+                    return d_cursor
+                frac = (cx - x_seg_start) / (x_seg_end - x_seg_start)
+                return d_cursor + frac * (bs - d_cursor)
+            x_stub_end = x_seg_end + self.BREAK_STUB_PX
+            if cx <= x_stub_end:
+                return (bs + be) / 2
+            d_cursor = be
+        # Final segment after all breaks
+        x_seg_start = self._x(d_cursor)
+        x_seg_end   = self._x(self.max_date)
+        if x_seg_end <= x_seg_start:
+            return d_cursor
+        frac = (cx - x_seg_start) / max(x_seg_end - x_seg_start, 1)
+        return d_cursor + max(0.0, min(1.0, frac)) * (self.max_date - d_cursor)
 
     def _lane_y(self, lane_index):
         rh = getattr(self, "_row_heights", None)
@@ -3088,9 +3191,42 @@ class TimelineView:
         tick = start_tick
         while tick <= self.max_date:
             x = self._x(tick)
-            c.create_line(x, 0, x, H, fill="#cccccc", width=1,
-                          dash=(3, 6), tags="bg")
+            in_break = any(
+                self._x(b['start']) <= x <= self._x(b['start']) + self.BREAK_STUB_PX
+                for b in self._breaks
+            )
+            if not in_break:
+                c.create_line(x, 0, x, H, fill="#cccccc", width=1,
+                              dash=(3, 6), tags="bg")
             tick += interval
+
+    def _zigzag_pts(self, x, y_top, y_bot, amp=4, period=10):
+        """Return flat coordinate list for a vertical zig-zag line at x."""
+        pts = [x, y_top]
+        y = y_top
+        direction = 1
+        half = period / 2
+        while y + half < y_bot:
+            y += half
+            pts.extend([x + direction * amp, y])
+            direction = -direction
+        pts.extend([x, y_bot])
+        return pts
+
+    def _draw_break_markers(self, H):
+        """Draw zig-zag break indicators on the main canvas."""
+        c = self.canvas
+        for b in self._breaks:
+            bs, be = b['start'], b['end']
+            if be <= self.min_date or bs >= self.max_date:
+                continue
+            x1 = self._x(bs)
+            x2 = x1 + self.BREAK_STUB_PX
+            c.create_rectangle(x1, 0, x2, H, fill="#c8c8c8", outline="", tags="bg")
+            pts_l = self._zigzag_pts(x1, 0, H, amp=5, period=12)
+            c.create_line(*pts_l, fill="#666666", width=2, tags="bg")
+            pts_r = self._zigzag_pts(x2, 0, H, amp=-5, period=12)
+            c.create_line(*pts_r, fill="#666666", width=2, tags="bg")
 
     def _draw_ruler(self, W):
         c = self.ruler_canvas
@@ -3100,17 +3236,38 @@ class TimelineView:
         # Bottom edge
         c.create_line(0, H, W, H, fill="#1a252f", width=2)
 
+        # Pass 1: draw break backgrounds and zig-zags
+        for b in self._breaks:
+            bs, be = b['start'], b['end']
+            if be <= self.min_date or bs >= self.max_date:
+                continue
+            x1 = self._x(bs)
+            x2 = x1 + self.BREAK_STUB_PX
+            c.create_rectangle(x1, 0, x2, H, fill="#1a2535", outline="")
+            pts_l = self._zigzag_pts(x1, 0, H, amp=4, period=10)
+            c.create_line(*pts_l, fill="#aaaaaa", width=1)
+            pts_r = self._zigzag_pts(x2, 0, H, amp=-4, period=10)
+            c.create_line(*pts_r, fill="#aaaaaa", width=1)
+
+        # Pass 2: draw tick marks and labels on top
         import math
         interval = self._tick_interval_cache
         start_tick = math.floor(self.min_date / interval) * interval
         tick = start_tick
         while tick <= self.max_date:
             x = self._x(tick)
-            c.create_line(x, H - 10, x, H, fill="#ffffff", width=1)
-            label = self._format_tick(tick)
-            c.create_text(x, H - 16, text=label, fill="#ffffff",
-                          font=("Arial", 8), anchor=tk.S)
+            in_break = any(
+                self._x(b['start']) <= x <= self._x(b['start']) + self.BREAK_STUB_PX
+                for b in self._breaks
+            )
+            if not in_break:
+                c.create_line(x, H - 10, x, H, fill="#ffffff", width=1)
+                label = self._format_tick(tick)
+                c.create_text(x, H - 16, text=label, fill="#ffffff",
+                              font=("Arial", 8, "bold"), anchor=tk.S)
             tick += interval
+
+        # Pass 1 already drew zig-zags; width=1, no // label needed
 
     def _draw_lane_labels(self):
         if self._cat_header_style not in ("Left", "Both"):
@@ -3724,7 +3881,7 @@ class TimelineView:
         # Record the date under the cursor before changing the scale
         if event is not None:
             cx = self.canvas.canvasx(event.x)
-            date_at_cursor = self.min_date + (cx - self.CANVAS_MARGIN) / self.px_per_year
+            date_at_cursor = self._date_from_x(cx)
             screen_x = event.x   # pixel position within the canvas widget
 
         self.px_per_year = max(min(self.px_per_year * factor, 50000), 0.000001)
@@ -3732,7 +3889,7 @@ class TimelineView:
 
         # Scroll so the date that was under the cursor stays at the same screen x
         if event is not None:
-            new_cx = self.CANVAS_MARGIN + (date_at_cursor - self.min_date) * self.px_per_year
+            new_cx = self._x(date_at_cursor)
             new_offset = new_cx - screen_x
             W = self._canvas_width()
             if W > 0:
@@ -3753,7 +3910,7 @@ class TimelineView:
                     visible_vals.append(e["end_value"])
         if visible_vals:
             vis_min = min(visible_vals)
-            cx = self.CANVAS_MARGIN + (vis_min - self.min_date) * self.px_per_year
+            cx = self._x(vis_min)
             W  = self._canvas_width()
             if W > 0:
                 fraction = max(0.0, min(1.0, (cx - self.CANVAS_MARGIN) / W))
@@ -3776,11 +3933,32 @@ class TimelineView:
                 if e.get("end_value") is not None:
                     visible_vals.append(e["end_value"])
         if visible_vals:
-            span = (max(visible_vals) - min(visible_vals)) or 1
+            vis_min = min(visible_vals)
+            vis_max = max(visible_vals)
+            span = (vis_max - vis_min) or 1
         else:
-            span = self.max_date - self.min_date or 1
+            vis_min = self.min_date
+            vis_max = self.max_date
+            span = (vis_max - vis_min) or 1
 
-        self.px_per_year = max(w / span, 1e-15)
+        # Subtract break spans that fall within the visible range so the
+        # solved px_per_year accounts for the compression.
+        break_span_in_range = 0.0
+        n_breaks_in_range   = 0
+        for b in getattr(self, '_breaks', []):
+            bs = max(b['start'], vis_min)
+            be = min(b['end'],   vis_max)
+            if be > bs:
+                break_span_in_range += be - bs
+                n_breaks_in_range   += 1
+
+        effective_span = span - break_span_in_range
+        if effective_span > 0:
+            self.px_per_year = max(
+                (w - n_breaks_in_range * self.BREAK_STUB_PX) / effective_span,
+                1e-15)
+        else:
+            self.px_per_year = max(w / span, 1e-15)
         self._draw()
         self._scroll_to_visible()
 
@@ -4422,7 +4600,7 @@ class TimelineView:
 
         # Convert cursor x to a date value and pick appropriate unit
         cx = self.canvas.canvasx(event.x)
-        date_val = self.min_date + (cx - self.CANVAS_MARGIN) / self.px_per_year
+        date_val = self._date_from_x(cx)
         if date_val <= -1_000_000_000:
             unit = "BYA"
         elif date_val <= -1_000_000:
@@ -4442,6 +4620,220 @@ class TimelineView:
             "image": None, "image_name": None, "image_type": None,
         }
         self._open_edit_event_dialog(blank)
+
+    def _on_ruler_motion(self, event):
+        self._last_mouse_x = event.x
+        cx = self.ruler_canvas.canvasx(event.x)
+        for b in getattr(self, '_breaks', []):
+            x1 = self._x(b['start'])
+            x2 = x1 + self.BREAK_STUB_PX
+            if x1 <= cx <= x2:
+                tip = f"Break: {self._format_tick(b['start'])} → {self._format_tick(b['end'])}"
+                self._icon_tooltip_show(tip, event.x_root, event.y_root)
+                return
+        self._icon_tooltip_hide()
+
+    def _on_ruler_right_click(self, event):
+        cx = self.ruler_canvas.canvasx(event.x)
+        date_at_click = self._date_from_x(cx)
+
+        near_break = None
+        for b in self._breaks:
+            x1 = self._x(b['start'])
+            x2 = x1 + self.BREAK_STUB_PX
+            if x1 - 8 <= cx <= x2 + 8:
+                near_break = b
+                break
+
+        menu = tk.Menu(self.win, tearoff=0)
+        if near_break:
+            menu.add_command(label="Edit Break...",
+                             command=lambda b=near_break: self._open_edit_break_dialog(b))
+            menu.add_command(label="Remove Break",
+                             command=lambda b=near_break: self._delete_break(b['id']))
+        else:
+            menu.add_command(label="Add Break Here...",
+                             command=lambda: self._open_add_break_dialog(date_at_click))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _delete_break(self, break_id):
+        self.db.delete_timeline_break(break_id)
+        self._breaks = self.db.load_timeline_breaks(self.db.active_timeline_id)
+        self._draw()
+
+    def _open_edit_break_dialog(self, b):
+        dlg = tk.Toplevel(self.win)
+        dlg.title("Edit Timeline Break")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.win)
+
+        def _val_to_parts(val):
+            if val <= -1_000_000_000:
+                return f"{abs(val)/1_000_000_000:g}", "BYA"
+            elif val <= -1_000_000:
+                return f"{abs(val)/1_000_000:g}", "MYA"
+            elif val < 0:
+                return str(int(abs(val))), "BCE"
+            else:
+                return str(int(val)), "CE"
+
+        def _date_row(grid_row, label_text, init_val):
+            tk.Label(dlg, text=label_text).grid(
+                row=grid_row, column=0, sticky="e", padx=(12, 4), pady=3)
+            frame = tk.Frame(dlg)
+            frame.grid(row=grid_row, column=1, sticky="w", pady=3, padx=(0, 12))
+            num_s, unit_s = _val_to_parts(init_val)
+            num_var  = tk.StringVar(value=num_s)
+            unit_var = tk.StringVar(value=unit_s)
+            tk.Entry(frame, textvariable=num_var, width=10).pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Combobox(frame, textvariable=unit_var,
+                         values=["CE", "BCE", "MYA", "BYA"],
+                         width=5, state="readonly").pack(side=tk.LEFT)
+            return num_var, unit_var
+
+        start_num, start_unit = _date_row(0, "Break Start:", b['start'])
+        end_num,   end_unit   = _date_row(1, "Break End:",   b['end'])
+
+        def _ok():
+            sv = _date_value(start_num.get().strip(), start_unit.get())
+            ev = _date_value(end_num.get().strip(),   end_unit.get())
+            if sv is None or ev is None:
+                messagebox.showerror("Invalid Date", "Enter valid dates.", parent=dlg)
+                return
+            if sv >= ev:
+                messagebox.showerror("Invalid Range",
+                                     "Break Start must be before Break End.", parent=dlg)
+                return
+            dlg.destroy()
+            self.db.update_timeline_break(b['id'], sv, ev)
+            self._breaks = self.db.load_timeline_breaks(self.db.active_timeline_id)
+            self._draw()
+
+        btn_f = tk.Frame(dlg)
+        btn_f.grid(row=2, column=0, columnspan=2, pady=(8, 10))
+        tk.Button(btn_f, text="OK",     width=8, command=_ok).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_f, text="Cancel", width=8, command=dlg.destroy).pack(side=tk.LEFT, padx=4)
+        dlg.columnconfigure(1, weight=1)
+        self.win.update_idletasks()
+        wx = self.win.winfo_rootx() + self.win.winfo_width()  // 2 - 210
+        wy = self.win.winfo_rooty() + self.win.winfo_height() // 2 - 80
+        dlg.geometry(f"+{max(0,wx)}+{max(0,wy)}")
+
+    def _open_add_break_dialog(self, date_hint):
+        dlg = tk.Toplevel(self.win)
+        dlg.title("Add Timeline Break")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.win)
+
+        if date_hint <= -1_000_000_000:
+            hint_unit, hint_num = "BYA", f"{abs(date_hint)/1_000_000_000:g}"
+        elif date_hint <= -1_000_000:
+            hint_unit, hint_num = "MYA", f"{abs(date_hint)/1_000_000:g}"
+        elif date_hint < 0:
+            hint_unit, hint_num = "BCE", str(int(abs(date_hint)))
+        else:
+            hint_unit, hint_num = "CE", str(int(date_hint))
+
+        tk.Label(dlg,
+                 text="A break compresses the gap between two dates on the ruler.",
+                 font=("Arial", 9), fg="#555555").grid(
+            row=0, column=0, columnspan=2, padx=12, pady=(10, 6), sticky="w")
+
+        def _date_row(grid_row, label_text):
+            tk.Label(dlg, text=label_text).grid(
+                row=grid_row, column=0, sticky="e", padx=(12, 4), pady=3)
+            frame = tk.Frame(dlg)
+            frame.grid(row=grid_row, column=1, sticky="w", pady=3, padx=(0, 12))
+            num_var  = tk.StringVar(value=hint_num)
+            unit_var = tk.StringVar(value=hint_unit)
+            tk.Entry(frame, textvariable=num_var, width=10).pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Combobox(frame, textvariable=unit_var,
+                         values=["CE", "BCE", "MYA", "BYA"],
+                         width=5, state="readonly").pack(side=tk.LEFT)
+            return num_var, unit_var
+
+        start_num, start_unit = _date_row(1, "Break Start:")
+        end_num,   end_unit   = _date_row(2, "Break End:")
+
+        def _ok():
+            sv = _date_value(start_num.get().strip(), start_unit.get())
+            ev = _date_value(end_num.get().strip(),   end_unit.get())
+            if sv is None or ev is None:
+                messagebox.showerror("Invalid Date", "Enter valid dates.", parent=dlg)
+                return
+            if sv >= ev:
+                messagebox.showerror("Invalid Range",
+                                     "Break Start must be before Break End.", parent=dlg)
+                return
+            dlg.destroy()
+            self.db.add_timeline_break(self.db.active_timeline_id, sv, ev)
+            self._breaks = self.db.load_timeline_breaks(self.db.active_timeline_id)
+            self._draw()
+
+        btn_f = tk.Frame(dlg)
+        btn_f.grid(row=3, column=0, columnspan=2, pady=(6, 10))
+        tk.Button(btn_f, text="OK",     width=8, command=_ok).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_f, text="Cancel", width=8, command=dlg.destroy).pack(side=tk.LEFT, padx=4)
+        dlg.columnconfigure(1, weight=1)
+        self.win.update_idletasks()
+        wx = self.win.winfo_rootx() + self.win.winfo_width()  // 2 - 210
+        wy = self.win.winfo_rooty() + self.win.winfo_height() // 2 - 90
+        dlg.geometry(f"+{max(0,wx)}+{max(0,wy)}")
+
+    def _open_manage_breaks_dialog(self):
+        dlg = tk.Toplevel(self.win)
+        dlg.title("Manage Timeline Breaks")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+        dlg.transient(self.win)
+
+        tk.Label(dlg, text="Timeline Breaks:",
+                 font=("Arial", 10, "bold")).pack(padx=12, pady=(10, 4), anchor="w")
+
+        frame = tk.Frame(dlg)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+
+        tree = ttk.Treeview(frame, columns=("start", "end"), show="headings", height=8)
+        tree.heading("start", text="Break Start")
+        tree.heading("end",   text="Break End")
+        tree.column("start", width=160)
+        tree.column("end",   width=160)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _refresh():
+            tree.delete(*tree.get_children())
+            for b in self._breaks:
+                tree.insert("", "end", iid=str(b['id']),
+                            values=(self._format_tick(b['start']),
+                                    self._format_tick(b['end'])))
+        _refresh()
+
+        def _delete_selected():
+            for iid in tree.selection():
+                self.db.delete_timeline_break(int(iid))
+            self._breaks = self.db.load_timeline_breaks(self.db.active_timeline_id)
+            _refresh()
+            self._draw()
+
+        def _add():
+            dlg.destroy()
+            self._open_add_break_dialog((self.min_date + self.max_date) / 2)
+
+        btn_f = tk.Frame(dlg)
+        btn_f.pack(padx=12, pady=(0, 10), anchor="w")
+        tk.Button(btn_f, text="Delete Selected", command=_delete_selected).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_f, text="Add Break...",    command=_add).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_f, text="Close",           command=dlg.destroy).pack(side=tk.LEFT)
+
+        self.win.update_idletasks()
+        wx = self.win.winfo_rootx() + self.win.winfo_width()  // 2 - 200
+        wy = self.win.winfo_rooty() + self.win.winfo_height() // 2 - 140
+        dlg.geometry(f"440x280+{max(0,wx)}+{max(0,wy)}")
 
     def _update_status(self):
         W = self._canvas_width()
