@@ -360,6 +360,22 @@ class TimelineDB:
                 (ruler_min, ruler_max, 1 if ruler_max_is_present else 0, timeline_id)
             )
 
+    def get_published_id(self, timeline_id):
+        """Return the Supabase UUID for this timeline, or None if never published."""
+        with sqlite3.connect(self.db_file) as conn:
+            row = conn.execute(
+                "SELECT published_id FROM Timeline WHERE TimelineID=?", (timeline_id,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def save_published_id(self, timeline_id, published_id):
+        """Persist the Supabase UUID after a successful publish."""
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute(
+                "UPDATE Timeline SET published_id=? WHERE TimelineID=?",
+                (published_id, timeline_id)
+            )
+
     def load_timeline_breaks(self, timeline_id):
         """Return list of {id, start, end} dicts sorted by start."""
         with sqlite3.connect(self.db_file) as conn:
@@ -654,6 +670,8 @@ class TimelineDB:
                 conn.execute("ALTER TABLE Timeline ADD COLUMN bg_image_name TEXT")
             if "bg_image_pos" not in tl_cols:
                 conn.execute("ALTER TABLE Timeline ADD COLUMN bg_image_pos TEXT DEFAULT 'Top'")
+            if "published_id" not in tl_cols:
+                conn.execute("ALTER TABLE Timeline ADD COLUMN published_id TEXT")
 
             if "timelineid" not in cat_cols:
                 conn.execute("ALTER TABLE Category ADD COLUMN timelineid INTEGER REFERENCES Timeline(TimelineID)")

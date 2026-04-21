@@ -51,9 +51,10 @@ def _content_type(filename: str) -> str:
 
 
 def _upload_image(storage, path: str, blob: bytes, filename: str):
-    """Upload blob to storage and return its public URL."""
+    """Upload (or overwrite) blob in storage and return its public URL."""
     storage.from_(_STORAGE_BUCKET).upload(
-        path, blob, {"content-type": _content_type(filename)}
+        path, blob,
+        {"content-type": _content_type(filename), "upsert": "true"},
     )
     return storage.from_(_STORAGE_BUCKET).get_public_url(path)
 
@@ -76,17 +77,18 @@ class TimelineHubPublisher:
     def publish(self, db, title: str, description: str, browse_category: str,
                 status_cb=None) -> str:
         """
-        Publish structured timeline data to the four Supabase tables.
+        Publish (or re-publish) structured timeline data to the four Supabase tables.
         Returns the live page URL.
 
-        db             — TimelineDB instance (the desktop app's data layer)
-        title          — timeline title (may differ from db title)
-        description    — user-supplied description
-        browse_category — one of CATEGORIES
-        status_cb      — optional callable(str) for progress messages
+        On first publish: inserts a new timeline row and saves the UUID locally.
+        On re-publish:    deletes the old categories/events/breaks and updates the
+                          existing timeline row so the URL stays the same.
+
+        Storage paths use local SQLite IDs so images are overwritten cleanly on
+        re-publish rather than accumulating orphaned files.
         """
-        c   = self._client
-        uid = self._user_id
+        c     = self._client
+        uid   = self._user_id
         tl_id = db.active_timeline_id
 
         def _status(msg):
@@ -98,34 +100,50 @@ class TimelineHubPublisher:
         db.load()
         db.load_categories()
         ruler_min, ruler_max, ruler_max_is_present = db.load_timeline_ruler(tl_id)
-        view_state          = db.load_timeline_view_state(tl_id)
-        cat_header_style    = db.load_timeline_cat_header_style(tl_id)
+        view_state           = db.load_timeline_view_state(tl_id)
+        cat_header_style     = db.load_timeline_cat_header_style(tl_id)
         cat_header_title_pos = db.load_timeline_cat_header_title_pos(tl_id)
-        canvas_bg_color     = db.load_timeline_canvas_bg(tl_id)
+        canvas_bg_color      = db.load_timeline_canvas_bg(tl_id)
         bg_image, bg_image_name, bg_image_pos = db.load_timeline_bg_image(tl_id)
-        breaks              = db.load_timeline_breaks(tl_id)
+        breaks               = db.load_timeline_breaks(tl_id)
 
-        # ── step 1: insert timeline row ───────────────────────────────────────
-        _status("Creating timeline record…")
-        tl_row = c.table("timeline").insert({
-            "title":               title,
-            "user_id":             uid,
-            "description":         description,
-            "browse_category":     browse_category,
-            "px_per_year":         view_state["px_per_year"] if view_state else None,
-            "ruler_min":           ruler_min,
-            "ruler_max":           ruler_max,
+        tl_payload = {
+            "title":                title,
+            "user_id":              uid,
+            "description":          description,
+            "browse_category":      browse_category,
+            "px_per_year":          view_state["px_per_year"] if view_state else None,
+            "ruler_min":            ruler_min,
+            "ruler_max":            ruler_max,
             "ruler_max_is_present": bool(ruler_max_is_present),
-            "cat_header_style":    cat_header_style or "Left",
+            "cat_header_style":     cat_header_style or "Left",
             "cat_header_title_pos": cat_header_title_pos or "Center (View)",
-            "canvas_bg_color":     canvas_bg_color,
-            "bg_image_pos":        bg_image_pos or "Top",
-        }).execute()
-        new_tl_id = tl_row.data[0]["id"]   # UUID string
+            "canvas_bg_color":      canvas_bg_color,
+            "bg_image_pos":         bg_image_pos or "Top",
+        }
 
-        # ── step 2: insert categories (depth-first order from cat_nodes) ──────
-        # cat_nodes is already depth-first so parents always appear before children.
-        cat_id_map = {}   # internal SQLite CategoryID → Supabase bigint id
+        # ── step 1: insert or update the timeline row ─────────────────────────
+        existing_uuid = db.get_published_id(tl_id)
+
+        if existing_uuid:
+            # Re-publish: wipe old child records, keep the same UUID and URL
+            _status("Updating existing timeline record…")
+            c.table("timeline_break").delete().eq("timeline_id", existing_uuid).execute()
+            c.table("event").delete().eq("timeline_id", existing_uuid).execute()
+            c.table("category").delete().eq("timeline_id", existing_uuid).execute()
+            c.table("timeline").update(tl_payload).eq("id", existing_uuid).execute()
+            new_tl_id = existing_uuid
+        else:
+            # First publish: insert and remember the generated UUID
+            _status("Creating timeline record…")
+            row = c.table("timeline").insert(tl_payload).execute()
+            new_tl_id = row.data[0]["id"]
+            db.save_published_id(tl_id, new_tl_id)
+
+        # ── step 2: insert categories ─────────────────────────────────────────
+        # cat_nodes is depth-first so parents always appear before children.
+        # Storage paths use the stable local SQLite ID so images overwrite cleanly.
+        cat_id_map = {}   # local SQLite CategoryID → Supabase bigint id
         total_cats = len(db.cat_nodes)
         for i, node in enumerate(db.cat_nodes):
             _status(f"Publishing categories… ({i + 1}/{total_cats})")
@@ -146,10 +164,9 @@ class TimelineHubPublisher:
             new_cat_id = cat_row.data[0]["id"]
             cat_id_map[node["id"]] = new_cat_id
 
-            # upload category image if present
             if node.get("cat_image"):
                 img_name     = node.get("cat_image_name") or "image.png"
-                storage_path = f"categories/{new_cat_id}/{img_name}"
+                storage_path = f"categories/{node['id']}/{img_name}"
                 img_url = _upload_image(c.storage, storage_path,
                                         node["cat_image"], img_name)
                 c.table("category").update(
@@ -162,39 +179,37 @@ class TimelineHubPublisher:
             _status(f"Publishing events… ({i + 1}/{total_evts})")
             new_cat_id = cat_id_map.get(evt.get("categoryid"))
             evt_row = c.table("event").insert({
-                "timeline_id":       new_tl_id,
-                "category_id":       new_cat_id,
-                "title":             evt["title"],
-                "desc":              evt.get("desc"),
-                "url":               evt.get("url"),
-                "citation":          evt.get("citation"),
-                "start_value":       evt.get("start_value"),
-                "start_display":     evt.get("start_display"),
-                "start_unit":        evt.get("start_unit"),
-                "start_month":       int(evt.get("start_month") or 0),
-                "start_day":         int(evt.get("start_day") or 0),
-                "end_value":         evt.get("end_value"),
-                "end_display":       evt.get("end_display"),
-                "end_unit":          evt.get("end_unit"),
-                "end_month":         int(evt.get("end_month") or 0),
-                "end_day":           int(evt.get("end_day") or 0),
-                "sort_order":        evt.get("sort_order"),
-                "standalone":        bool(evt.get("standalone")),
-                "hidden":            bool(evt.get("hidden")),
-                "picture_position":  evt.get("picture_position") or "",
-                "image_name":        evt.get("image_name"),
-                # linked_category_id mapped to new Supabase ID; linked_timeline_id
-                # not mapped (cross-timeline links require the other timeline to have
-                # been published first — not supported in this publish pass)
+                "timeline_id":        new_tl_id,
+                "category_id":        new_cat_id,
+                "title":              evt["title"],
+                "desc":               evt.get("desc"),
+                "url":                evt.get("url"),
+                "citation":           evt.get("citation"),
+                "start_value":        evt.get("start_value"),
+                "start_display":      evt.get("start_display"),
+                "start_unit":         evt.get("start_unit"),
+                "start_month":        int(evt.get("start_month") or 0),
+                "start_day":          int(evt.get("start_day") or 0),
+                "end_value":          evt.get("end_value"),
+                "end_display":        evt.get("end_display"),
+                "end_unit":           evt.get("end_unit"),
+                "end_month":          int(evt.get("end_month") or 0),
+                "end_day":            int(evt.get("end_day") or 0),
+                "sort_order":         evt.get("sort_order"),
+                "standalone":         bool(evt.get("standalone")),
+                "hidden":             bool(evt.get("hidden")),
+                "picture_position":   evt.get("picture_position") or "",
+                "image_name":         evt.get("image_name"),
                 "linked_category_id": cat_id_map.get(evt.get("linked_categoryid")),
+                # linked_timeline_id requires the linked timeline to have been
+                # published first; left null and can be wired up in a later pass
                 "linked_timeline_id": None,
             }).execute()
             new_evt_id = evt_row.data[0]["id"]
 
-            # upload event image if present
             if evt.get("image"):
                 img_name     = evt.get("image_name") or "image.png"
-                storage_path = f"events/{new_evt_id}/{img_name}"
+                storage_path = f"events/{evt['id']}/{img_name}"
                 img_url = _upload_image(c.storage, storage_path,
                                         evt["image"], img_name)
                 c.table("event").update(
