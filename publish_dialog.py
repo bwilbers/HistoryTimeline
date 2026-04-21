@@ -12,6 +12,12 @@ import io
 import json
 import tempfile
 
+CAT_COLORS = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
+    "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
+    "#9c755f", "#bab0ac",
+]
+
 SUPABASE_URL    = "https://tbpjthbywlgbxokfhhji.supabase.co"
 SUPABASE_KEY    = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
                    ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRicGp0aGJ5d2xnYnhva2ZoaGppIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY2Mzc2NDUsImV4cCI6MjA5MjIxMzY0NX0"
@@ -184,9 +190,9 @@ class TimelineHubPublisher:
                 "timeline_id":    new_tl_id,
                 "parent_id":      new_parent_id,
                 "title":          node["title"],
-                "sort_order":     node.get("sort_order") or i,
+                "sort_order":     i + 1,
                 "hidden":         bool(node.get("hidden")),
-                "color":          node.get("color"),
+                "color":          node.get("color") or CAT_COLORS[i % len(CAT_COLORS)],
                 "row_bg_color":   node.get("row_bg_color"),
                 "show_row_guide": bool(node.get("show_row_guide", True)),
                 "cat_image_pos":  node.get("cat_image_pos") or "Row",
