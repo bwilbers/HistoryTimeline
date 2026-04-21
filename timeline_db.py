@@ -736,6 +736,9 @@ class TimelineDB:
             if "linked_timelineid" not in event_cols:
                 conn.execute("ALTER TABLE events ADD COLUMN linked_timelineid INTEGER")
 
+            if "citation" not in event_cols:
+                conn.execute("ALTER TABLE events ADD COLUMN citation TEXT")
+
             # Timeline break table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS TimelineBreak (
@@ -819,7 +822,7 @@ class TimelineDB:
                        e.start_value, e.start_display, e.start_unit, e.start_month, e.start_day,
                        e.end_value,   e.end_display,   e.end_unit,   e.end_month,   e.end_day,
                        e.sort_order, e.standalone, e.hidden, e.picture_position,
-                       e.linked_categoryid, e.linked_timelineid
+                       e.linked_categoryid, e.linked_timelineid, e.citation
                 FROM events e
                 LEFT JOIN Category c ON e.categoryid = c.CategoryID
                 WHERE e.timelineid=?
@@ -867,7 +870,8 @@ class TimelineDB:
                         "image=?, image_name=?, image_type=?, "
                         "start_value=?, start_display=?, start_unit=?, start_month=?, start_day=?, "
                         "end_value=?,   end_display=?,   end_unit=?,   end_month=?,   end_day=?, "
-                        "standalone=?, sort_order=?, hidden=?, linked_categoryid=?, linked_timelineid=? "
+                        "standalone=?, sort_order=?, hidden=?, linked_categoryid=?, linked_timelineid=?, "
+                        "citation=? "
                         "WHERE id=?",
                         (e["title"], e.get("year", 0), e["desc"], cat_id, e.get("url", ""),
                          e.get("image"), e.get("image_name"), e.get("image_type"),
@@ -877,6 +881,7 @@ class TimelineDB:
                          e.get("end_month"), e.get("end_day"),
                          e.get("standalone", 0), e.get("sort_order"), e.get("hidden", 0),
                          e.get("linked_categoryid"), e.get("linked_timelineid"),
+                         e.get("citation") or None,
                          e["id"])
                     )
 
@@ -886,7 +891,7 @@ class TimelineDB:
             start_month=None, start_day=None,
             end_value=None, end_display="", end_unit="CE",
             end_month=None, end_day=None, standalone=0, linked_categoryid=None,
-            linked_timelineid=None):
+            linked_timelineid=None, citation=None):
         with sqlite3.connect(self.db_file) as conn:
             cat_id = self._ensure_category(conn, category)
             year = int(start_value) if start_value is not None else 0
@@ -900,13 +905,13 @@ class TimelineDB:
                 "image, image_name, image_type, "
                 "start_value, start_display, start_unit, start_month, start_day, "
                 "end_value, end_display, end_unit, end_month, end_day, standalone, sort_order, hidden, "
-                "linked_categoryid, linked_timelineid) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "linked_categoryid, linked_timelineid, citation) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (title, year, desc, cat_id, self.active_timeline_id, url,
                  image, image_name, image_type,
                  start_value, start_display, start_unit, start_month, start_day,
                  end_value, end_display, end_unit, end_month, end_day, standalone, next_order, 0,
-                 linked_categoryid, linked_timelineid)
+                 linked_categoryid, linked_timelineid, citation or None)
             )
             new_id = cursor.lastrowid
         self.events.append({
@@ -919,6 +924,7 @@ class TimelineDB:
             "end_unit": end_unit, "end_month": end_month, "end_day": end_day,
             "standalone": standalone, "sort_order": next_order, "hidden": False,
             "linked_categoryid": linked_categoryid, "linked_timelineid": linked_timelineid,
+            "citation": citation or None,
         })
 
     @staticmethod
@@ -2483,8 +2489,28 @@ class TimelineView:
         dlg.resizable(True, True)
         dlg.grab_set()
 
-        f = tk.LabelFrame(dlg, text="Event", padx=10, pady=10)
-        f.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        # ── Scrollable form area ───────────────────────────────────────────────
+        outer = tk.Frame(dlg)
+        outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        scroll_canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = tk.Scrollbar(outer, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        f = tk.LabelFrame(scroll_canvas, text="Event", padx=10, pady=10)
+        scroll_canvas.create_window((0, 0), window=f, anchor="nw")
+
+        def _on_frame_configure(e):
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+            scroll_canvas.configure(width=f.winfo_reqwidth())
+        f.bind("<Configure>", _on_frame_configure)
+
+        def _on_mousewheel(e):
+            scroll_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        dlg.bind("<Destroy>", lambda e: scroll_canvas.unbind_all("<MouseWheel>"))
+
         pad = dict(padx=5, pady=3)
 
         # ── ID (readonly) ──────────────────────────────────────────────────────
@@ -2620,20 +2646,27 @@ class TimelineView:
         url_var.trace_add("write", _update_url_buttons)
         _update_url_buttons()
 
+        # ── Citation ──────────────────────────────────────────────────────────
+        tk.Label(f, text="Citation:").grid(row=7, column=0, sticky=tk.NW, **pad)
+        citation_text = tk.Text(f, width=48, height=3, wrap=tk.WORD,
+                                relief=tk.SUNKEN, bd=1, font=("Arial", 9))
+        citation_text.grid(row=7, column=1, sticky=tk.W, **pad)
+        citation_text.insert("1.0", evt.get("citation") or "")
+
         # ── Standalone checkbox ────────────────────────────────────────────────
         standalone_var = tk.IntVar(value=1 if evt.get("standalone") else 0)
         tk.Checkbutton(f, text="Own row in timeline",
-                       variable=standalone_var).grid(row=7, column=1, sticky=tk.W, pady=(4, 0))
+                       variable=standalone_var).grid(row=8, column=1, sticky=tk.W, pady=(4, 0))
 
         # ── Hidden checkbox ────────────────────────────────────────────────────
         hidden_evt_var = tk.IntVar(value=1 if evt.get("hidden") else 0)
         tk.Checkbutton(f, text="Hidden (exclude from timeline)",
-                       variable=hidden_evt_var).grid(row=8, column=1, sticky=tk.W, pady=(2, 0))
+                       variable=hidden_evt_var).grid(row=9, column=1, sticky=tk.W, pady=(2, 0))
 
         # ── Linked Category ───────────────────────────────────────────────────
-        tk.Label(f, text="Linked Category:").grid(row=9, column=0, sticky=tk.W, **pad)
+        tk.Label(f, text="Linked Category:").grid(row=10, column=0, sticky=tk.W, **pad)
         link_cat_frame = tk.Frame(f)
-        link_cat_frame.grid(row=9, column=1, sticky=tk.W, **pad)
+        link_cat_frame.grid(row=10, column=1, sticky=tk.W, **pad)
         link_display_list = ["(none)"] + [n["path"] for n in cat_nodes]
         link_cat_id_map   = {n["path"]: n["id"] for n in cat_nodes}
         link_cat_var = tk.StringVar()
@@ -2648,9 +2681,9 @@ class TimelineView:
                  font=("Arial", 8), fg="gray").pack(side=tk.LEFT)
 
         # ── Linked Timeline ───────────────────────────────────────────────────
-        tk.Label(f, text="Linked Timeline:").grid(row=10, column=0, sticky=tk.W, **pad)
+        tk.Label(f, text="Linked Timeline:").grid(row=11, column=0, sticky=tk.W, **pad)
         link_tl_frame = tk.Frame(f)
-        link_tl_frame.grid(row=10, column=1, sticky=tk.W, **pad)
+        link_tl_frame.grid(row=11, column=1, sticky=tk.W, **pad)
         all_timelines     = self.db.load_timelines()   # [(id, title), ...]
         link_tl_id_map    = {title: tid for tid, title in all_timelines}
         link_tl_display   = ["(none)"] + [title for _, title in all_timelines]
@@ -2663,33 +2696,38 @@ class TimelineView:
         tk.Label(link_tl_frame, text="  Arrow icon navigates to linked timeline",
                  font=("Arial", 8), fg="gray").pack(side=tk.LEFT)
 
-        # ── Picture position ──────────────────────────────────────────────────
-        tk.Label(f, text="Show Picture:").grid(row=11, column=0, sticky=tk.W, **pad)
+        # ── Image Panel ───────────────────────────────────────────────────────
+        img_panel = tk.LabelFrame(f, text="Image", padx=8, pady=6)
+        img_panel.grid(row=12, column=0, columnspan=2, sticky=tk.EW, **pad)
+
         PIC_POSITIONS = ["", "Left of Event", "Center of Event", "Right of Event"]
         pic_pos_var = tk.StringVar(value=evt.get("picture_position") or "")
-        ttk.Combobox(f, textvariable=pic_pos_var, values=PIC_POSITIONS,
-                     state="readonly", width=18).grid(row=11, column=1, sticky=tk.W, **pad)
-
-        # ── Image ─────────────────────────────────────────────────────────────
-        tk.Label(f, text="Image:").grid(row=12, column=0, sticky=tk.NW, **pad)
-        img_ctrl = tk.Frame(f)
-        img_ctrl.grid(row=12, column=1, sticky=tk.W, **pad)
 
         img_blob      = [evt.get("image")]
         img_name      = [evt.get("image_name")]
         img_type      = [evt.get("image_type")]
         img_name_var  = tk.StringVar(value=evt.get("image_name") or "")
-        tk.Label(img_ctrl, textvariable=img_name_var,
-                 font=("Arial", 8), fg="gray").pack(side=tk.TOP, anchor=tk.W)
-        img_btn_row = tk.Frame(img_ctrl)
-        img_btn_row.pack(side=tk.TOP, anchor=tk.W)
 
         blank_photo  = [ImageTk.PhotoImage(Image.new("RGB", (200, 200), "#f0f0f0"))]
         preview_photo = [None]
 
-        tk.Label(f, text="").grid(row=13, column=0)   # spacer
-        preview_lbl = tk.Label(f, relief=tk.SUNKEN, image=blank_photo[0], bg="#f0f0f0")
-        preview_lbl.grid(row=13, column=1, sticky=tk.W, **pad)
+        # Left: image preview
+        preview_lbl = tk.Label(img_panel, relief=tk.SUNKEN, image=blank_photo[0], bg="#f0f0f0")
+        preview_lbl.pack(side=tk.LEFT, anchor=tk.NW, padx=(0, 10))
+
+        # Right: controls stacked top-to-bottom
+        img_right = tk.Frame(img_panel)
+        img_right.pack(side=tk.LEFT, anchor=tk.NW, fill=tk.X, expand=True)
+
+        tk.Label(img_right, text="Show Image:").pack(anchor=tk.W)
+        ttk.Combobox(img_right, textvariable=pic_pos_var, values=PIC_POSITIONS,
+                     state="readonly", width=18).pack(anchor=tk.W, pady=(0, 6))
+
+        tk.Label(img_right, textvariable=img_name_var,
+                 font=("Arial", 8), fg="gray").pack(anchor=tk.W, pady=(0, 4))
+
+        img_btn_row = tk.Frame(img_right)
+        img_btn_row.pack(anchor=tk.W)
 
         def _show_preview(blob):
             if not blob:
@@ -2722,12 +2760,55 @@ class TimelineView:
             img_name_var.set("")
             preview_lbl.config(image=blank_photo[0])
 
-        tk.Button(img_btn_row, text="Browse...", command=_browse_image, width=10).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(img_btn_row, text="Clear",     command=_clear_image,  width=6).pack(side=tk.LEFT)
+        def _paste_image():
+            from PIL import ImageGrab
+            try:
+                pil_img = ImageGrab.grabclipboard()
+            except Exception as e:
+                messagebox.showerror("Paste Error", f"Could not read clipboard:\n{e}", parent=dlg)
+                return
+            # grabclipboard() returns a list of file paths when files are copied
+            if isinstance(pil_img, list):
+                paths = [p for p in pil_img
+                         if isinstance(p, str) and
+                         p.lower().endswith((".png",".jpg",".jpeg",".bmp",".gif",".webp"))]
+                if paths:
+                    try:
+                        pil_img = Image.open(paths[0])
+                    except Exception as e:
+                        messagebox.showerror("Paste Error", f"Could not open file:\n{e}", parent=dlg)
+                        return
+                else:
+                    messagebox.showinfo("Paste Image",
+                                        "No image found on the clipboard.", parent=dlg)
+                    return
+            if not isinstance(pil_img, Image.Image):
+                messagebox.showinfo("Paste Image",
+                                    "No image found on the clipboard.", parent=dlg)
+                return
+            try:
+                # Normalise to RGB/RGBA before saving as PNG
+                if pil_img.mode not in ("RGB", "RGBA"):
+                    pil_img = pil_img.convert("RGBA")
+                pil_img.thumbnail((200, 200), Image.LANCZOS)
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                blob = buf.getvalue()
+                img_blob[0] = blob
+                img_name[0] = "clipboard.png"
+                img_type[0] = "PNG"
+                img_name_var.set("clipboard.png")
+                _show_preview(blob)
+            except Exception as e:
+                messagebox.showerror("Paste Error", f"Could not process image:\n{e}", parent=dlg)
 
-        # ── Save / Cancel ──────────────────────────────────────────────────────
-        btn_frame = tk.Frame(f, pady=6)
-        btn_frame.grid(row=14, column=0, columnspan=2, pady=8)
+        tk.Button(img_btn_row, text="Browse...", command=_browse_image, width=10).grid(row=0, column=0, padx=(0, 4), pady=(0, 2))
+        tk.Button(img_btn_row, text="Paste",     command=_paste_image,  width=10).grid(row=0, column=1, pady=(0, 2))
+        tk.Button(img_btn_row, text="Clear",     command=_clear_image          ).grid(row=1, column=0, columnspan=2, sticky=tk.EW)
+
+        # ── Save / Delete / Close — pinned outside the scroll area ───────────
+        btn_frame = tk.Frame(dlg, pady=6)
+        btn_frame.pack(side=tk.BOTTOM, pady=(4, 8))
 
         def _read_date(nv, uv, mv, dv):
             unit = uv.get()
@@ -2785,8 +2866,9 @@ class TimelineView:
                                + "\n\nSave anyway?")
                         if not messagebox.askyesno("Event Outside Ruler Range", msg, parent=dlg):
                             return
-            desc = desc_text.get("1.0", tk.END).strip()
-            url  = url_var.get().strip()
+            desc     = desc_text.get("1.0", tk.END).strip()
+            url      = url_var.get().strip()
+            citation = citation_text.get("1.0", tk.END).strip() or None
             lc_val = link_cat_var.get()
             linked_catid = link_cat_id_map.get(lc_val) if lc_val != "(none)" else None
             lt_val = link_tl_var.get()
@@ -2805,15 +2887,15 @@ class TimelineView:
                         "start_value, start_display, start_unit, start_month, start_day, "
                         "end_value,   end_display,   end_unit,   end_month,   end_day,   "
                         "standalone, sort_order, hidden, picture_position, "
-                        "linked_categoryid, linked_timelineid) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "linked_categoryid, linked_timelineid, citation) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (new_title, int(sv) if sv else 0,
                          desc, cat_id, self.db.active_timeline_id, url,
                          img_blob[0], img_name[0], img_type[0],
                          sv, sd, su, sm, sday,
                          ev2, ed, eu, em, eday,
                          standalone_var.get(), next_order, hidden_evt_var.get(),
-                         pic_pos_var.get() or None, linked_catid, linked_tlid)
+                         pic_pos_var.get() or None, linked_catid, linked_tlid, citation)
                     )
                 else:
                     conn.execute(
@@ -2822,14 +2904,15 @@ class TimelineView:
                         "start_value=?, start_display=?, start_unit=?, start_month=?, start_day=?, "
                         "end_value=?, end_display=?, end_unit=?, end_month=?, end_day=?, "
                         "standalone=?, hidden=?, picture_position=?, "
-                        "linked_categoryid=?, linked_timelineid=? WHERE id=?",
+                        "linked_categoryid=?, linked_timelineid=?, citation=? WHERE id=?",
                         (new_title, int(sv) if sv else evt.get("year", 0),
                          desc, cat_id, url,
                          img_blob[0], img_name[0], img_type[0],
                          sv, sd, su, sm, sday,
                          ev2, ed, eu, em, eday,
                          standalone_var.get(), hidden_evt_var.get(),
-                         pic_pos_var.get() or None, linked_catid, linked_tlid, evt["id"])
+                         pic_pos_var.get() or None, linked_catid, linked_tlid,
+                         citation, evt["id"])
                     )
             dlg.destroy()
             self._reload(self.db.active_timeline_id)
@@ -2852,9 +2935,12 @@ class TimelineView:
         tk.Button(btn_frame, text="Close", width=12, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
         dlg.update_idletasks()
-        wx = self.win.winfo_x() + (self.win.winfo_width()  - dlg.winfo_width())  // 2
-        wy = self.win.winfo_y() + (self.win.winfo_height() - dlg.winfo_height()) // 2
-        dlg.geometry(f"+{max(0,wx)}+{max(0,wy)}")
+        # Cap height to 90% of screen; let scroll handle the rest
+        max_h = int(dlg.winfo_screenheight() * 0.90)
+        want_h = min(f.winfo_reqheight() + btn_frame.winfo_reqheight() + 60, max_h)
+        wx = self.win.winfo_x() + (self.win.winfo_width()  - dlg.winfo_reqwidth())  // 2
+        wy = self.win.winfo_y() + (self.win.winfo_height() - want_h) // 2
+        dlg.geometry(f"{dlg.winfo_reqwidth()}x{want_h}+{max(0,wx)}+{max(0,wy)}")
         title_entry.focus_set()
         return dlg
 
@@ -4475,6 +4561,13 @@ class TimelineView:
             tk.Frame(text_col, bg="#ddddbb", height=1).pack(fill=tk.X, pady=4)
             tk.Label(text_col, text=desc, bg="#fffde7",
                      font=("Arial", 8), fg="#333333", anchor=tk.W,
+                     justify=tk.LEFT, wraplength=280).pack(anchor=tk.W)
+
+        citation = e.get("citation") or ""
+        if citation:
+            tk.Frame(text_col, bg="#ddddbb", height=1).pack(fill=tk.X, pady=4)
+            tk.Label(text_col, text=f"Source: {citation}", bg="#fffde7",
+                     font=("Arial", 7, "italic"), fg="#666666", anchor=tk.W,
                      justify=tk.LEFT, wraplength=280).pack(anchor=tk.W)
 
         if url:
