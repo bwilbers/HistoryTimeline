@@ -55,17 +55,25 @@ def _content_type(filename: str) -> str:
 def _upload_image(storage, path: str, blob, filename: str):
     """Upload (or overwrite) blob in storage and return its public URL.
 
-    Writes to a temp file first so the SDK receives a file path,
-    which works across all supabase-py/storage3 versions.
+    Writes to a temp file so the SDK receives a file path, which
+    works across all supabase-py/storage3 versions.
+    Returns None and skips silently if blob is not valid binary data.
     """
+    # Guard: SQLite occasionally returns BLOB columns as str when the
+    # value was inserted without explicit bytes type. Skip rather than crash.
+    if isinstance(blob, str):
+        return None
+    if blob is None:
+        return None
+
     suffix = os.path.splitext(filename or ".png")[1] or ".png"
     fd, tmp_path = None, None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        data = bytes(blob) if not isinstance(blob, (bytes, bytearray)) else blob
+        data = blob if isinstance(blob, (bytes, bytearray)) else bytes(blob)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        fd = None  # fdopen took ownership; don't close again
+        fd = None  # fdopen took ownership
         storage.from_(_STORAGE_BUCKET).upload(
             path, tmp_path,
             {"content-type": _content_type(filename), "upsert": "true"},
@@ -193,9 +201,10 @@ class TimelineHubPublisher:
                 storage_path = f"categories/{node['id']}/{img_name}"
                 img_url = _upload_image(c.storage, storage_path,
                                         node["cat_image"], img_name)
-                c.table("category").update(
-                    {"cat_image_url": img_url}
-                ).eq("id", new_cat_id).execute()
+                if img_url:
+                    c.table("category").update(
+                        {"cat_image_url": img_url}
+                    ).eq("id", new_cat_id).execute()
 
         # ── step 3: insert events ─────────────────────────────────────────────
         total_evts = len(db.events)
@@ -236,9 +245,10 @@ class TimelineHubPublisher:
                 storage_path = f"events/{evt['id']}/{img_name}"
                 img_url = _upload_image(c.storage, storage_path,
                                         evt["image"], img_name)
-                c.table("event").update(
-                    {"image_url": img_url}
-                ).eq("id", new_evt_id).execute()
+                if img_url:
+                    c.table("event").update(
+                        {"image_url": img_url}
+                    ).eq("id", new_evt_id).execute()
 
         # ── step 4: insert timeline breaks ────────────────────────────────────
         if breaks:
