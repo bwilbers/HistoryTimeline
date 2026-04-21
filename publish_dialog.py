@@ -7,7 +7,6 @@ Requires:  pip install supabase
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
-import tempfile
 import os
 import json
 
@@ -18,7 +17,10 @@ SUPABASE_KEY    = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
 PLATFORM_URL    = "https://project-549x3.vercel.app"
 CATEGORIES      = ["History", "Science", "Biography", "Technology", "Geography", "Politics"]
 _CREDS_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".timelinehub_creds.json")
+_STORAGE_BUCKET = "timeline-images"
 
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _load_saved_email():
     try:
@@ -36,70 +38,211 @@ def _save_email(email):
         pass
 
 
+def _content_type(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    return {
+        ".png":  "image/png",
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif":  "image/gif",
+        ".bmp":  "image/bmp",
+        ".webp": "image/webp",
+    }.get(ext, "image/png")
+
+
+def _upload_image(storage, path: str, blob: bytes, filename: str):
+    """Upload blob to storage and return its public URL."""
+    storage.from_(_STORAGE_BUCKET).upload(
+        path, blob, {"content-type": _content_type(filename)}
+    )
+    return storage.from_(_STORAGE_BUCKET).get_public_url(path)
+
+
+# ── publisher ─────────────────────────────────────────────────────────────────
+
 class TimelineHubPublisher:
     """Handles auth and publishing to TimelineHub via Supabase."""
 
     def __init__(self):
-        self._client = None
+        self._client  = None
         self._user_id = None
 
     def sign_in(self, email: str, password: str):
         from supabase import create_client
-        self._client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self._client  = create_client(SUPABASE_URL, SUPABASE_KEY)
         resp = self._client.auth.sign_in_with_password({"email": email, "password": password})
         self._user_id = resp.user.id
 
-    def publish(self, pdf_path: str, title: str, description: str, category: str) -> str:
-        """Upload PDF and insert/update timelines row. Returns the live page URL."""
-        c = self._client
+    def publish(self, db, title: str, description: str, browse_category: str,
+                status_cb=None) -> str:
+        """
+        Publish structured timeline data to the four Supabase tables.
+        Returns the live page URL.
+
+        db             — TimelineDB instance (the desktop app's data layer)
+        title          — timeline title (may differ from db title)
+        description    — user-supplied description
+        browse_category — one of CATEGORIES
+        status_cb      — optional callable(str) for progress messages
+        """
+        c   = self._client
         uid = self._user_id
+        tl_id = db.active_timeline_id
 
-        # Insert row (pdf_url placeholder)
-        row = c.table("timelines").insert({
-            "user_id":     uid,
-            "title":       title,
-            "description": description,
-            "category":    category,
-            "pdf_url":     "",
+        def _status(msg):
+            if status_cb:
+                status_cb(msg)
+
+        # ── load all data from the local database ─────────────────────────────
+        _status("Loading timeline data…")
+        db.load()
+        db.load_categories()
+        ruler_min, ruler_max, ruler_max_is_present = db.load_timeline_ruler(tl_id)
+        view_state          = db.load_timeline_view_state(tl_id)
+        cat_header_style    = db.load_timeline_cat_header_style(tl_id)
+        cat_header_title_pos = db.load_timeline_cat_header_title_pos(tl_id)
+        canvas_bg_color     = db.load_timeline_canvas_bg(tl_id)
+        bg_image, bg_image_name, bg_image_pos = db.load_timeline_bg_image(tl_id)
+        breaks              = db.load_timeline_breaks(tl_id)
+
+        # ── step 1: insert timeline row ───────────────────────────────────────
+        _status("Creating timeline record…")
+        tl_row = c.table("timeline").insert({
+            "title":               title,
+            "user_id":             uid,
+            "description":         description,
+            "browse_category":     browse_category,
+            "px_per_year":         view_state["px_per_year"] if view_state else None,
+            "ruler_min":           ruler_min,
+            "ruler_max":           ruler_max,
+            "ruler_max_is_present": bool(ruler_max_is_present),
+            "cat_header_style":    cat_header_style or "Left",
+            "cat_header_title_pos": cat_header_title_pos or "Center (View)",
+            "canvas_bg_color":     canvas_bg_color,
+            "bg_image_pos":        bg_image_pos or "Top",
         }).execute()
-        timeline_id = row.data[0]["id"]
+        new_tl_id = tl_row.data[0]["id"]   # UUID string
 
-        # Upload PDF to Storage
-        storage_path = f"{uid}/{timeline_id}.pdf"
-        with open(pdf_path, "rb") as fh:
-            pdf_bytes = fh.read()
-        c.storage.from_("timelines").upload(
-            storage_path,
-            pdf_bytes,
-            {"content-type": "application/pdf"},
-        )
+        # ── step 2: insert categories (depth-first order from cat_nodes) ──────
+        # cat_nodes is already depth-first so parents always appear before children.
+        cat_id_map = {}   # internal SQLite CategoryID → Supabase bigint id
+        total_cats = len(db.cat_nodes)
+        for i, node in enumerate(db.cat_nodes):
+            _status(f"Publishing categories… ({i + 1}/{total_cats})")
+            new_parent_id = cat_id_map.get(node["parent_id"]) if node["parent_id"] else None
+            cat_row = c.table("category").insert({
+                "timeline_id":    new_tl_id,
+                "parent_id":      new_parent_id,
+                "title":          node["title"],
+                "sort_order":     node.get("sort_order") or i,
+                "hidden":         bool(node.get("hidden")),
+                "color":          node.get("color"),
+                "row_bg_color":   node.get("row_bg_color"),
+                "show_row_guide": bool(node.get("show_row_guide", True)),
+                "cat_image_pos":  node.get("cat_image_pos") or "Row",
+                "cat_pad_top":    int(node.get("cat_pad_top") or 0),
+                "cat_pad_bottom": int(node.get("cat_pad_bottom") or 0),
+            }).execute()
+            new_cat_id = cat_row.data[0]["id"]
+            cat_id_map[node["id"]] = new_cat_id
 
-        # Get public URL and patch the row
-        public_url = c.storage.from_("timelines").get_public_url(storage_path)
-        c.table("timelines").update({"pdf_url": public_url}).eq("id", timeline_id).execute()
+            # upload category image if present
+            if node.get("cat_image"):
+                img_name     = node.get("cat_image_name") or "image.png"
+                storage_path = f"categories/{new_cat_id}/{img_name}"
+                img_url = _upload_image(c.storage, storage_path,
+                                        node["cat_image"], img_name)
+                c.table("category").update(
+                    {"cat_image_url": img_url}
+                ).eq("id", new_cat_id).execute()
 
-        return f"{PLATFORM_URL}/timelines/{timeline_id}"
+        # ── step 3: insert events ─────────────────────────────────────────────
+        total_evts = len(db.events)
+        for i, evt in enumerate(db.events):
+            _status(f"Publishing events… ({i + 1}/{total_evts})")
+            new_cat_id = cat_id_map.get(evt.get("categoryid"))
+            evt_row = c.table("event").insert({
+                "timeline_id":       new_tl_id,
+                "category_id":       new_cat_id,
+                "title":             evt["title"],
+                "desc":              evt.get("desc"),
+                "url":               evt.get("url"),
+                "citation":          evt.get("citation"),
+                "start_value":       evt.get("start_value"),
+                "start_display":     evt.get("start_display"),
+                "start_unit":        evt.get("start_unit"),
+                "start_month":       int(evt.get("start_month") or 0),
+                "start_day":         int(evt.get("start_day") or 0),
+                "end_value":         evt.get("end_value"),
+                "end_display":       evt.get("end_display"),
+                "end_unit":          evt.get("end_unit"),
+                "end_month":         int(evt.get("end_month") or 0),
+                "end_day":           int(evt.get("end_day") or 0),
+                "sort_order":        evt.get("sort_order"),
+                "standalone":        bool(evt.get("standalone")),
+                "hidden":            bool(evt.get("hidden")),
+                "picture_position":  evt.get("picture_position") or "",
+                "image_name":        evt.get("image_name"),
+                # linked_category_id mapped to new Supabase ID; linked_timeline_id
+                # not mapped (cross-timeline links require the other timeline to have
+                # been published first — not supported in this publish pass)
+                "linked_category_id": cat_id_map.get(evt.get("linked_categoryid")),
+                "linked_timeline_id": None,
+            }).execute()
+            new_evt_id = evt_row.data[0]["id"]
 
+            # upload event image if present
+            if evt.get("image"):
+                img_name     = evt.get("image_name") or "image.png"
+                storage_path = f"events/{new_evt_id}/{img_name}"
+                img_url = _upload_image(c.storage, storage_path,
+                                        evt["image"], img_name)
+                c.table("event").update(
+                    {"image_url": img_url}
+                ).eq("id", new_evt_id).execute()
+
+        # ── step 4: insert timeline breaks ────────────────────────────────────
+        if breaks:
+            _status("Publishing timeline breaks…")
+        for b in breaks:
+            c.table("timeline_break").insert({
+                "timeline_id": new_tl_id,
+                "break_start": b["start"],
+                "break_end":   b["end"],
+            }).execute()
+
+        # ── step 5: upload background image and patch timeline row ────────────
+        if bg_image:
+            _status("Uploading background image…")
+            bg_name      = bg_image_name or "bg_image.png"
+            storage_path = f"timelines/{new_tl_id}/{bg_name}"
+            bg_url = _upload_image(c.storage, storage_path, bg_image, bg_name)
+            c.table("timeline").update(
+                {"bg_image_url": bg_url}
+            ).eq("id", new_tl_id).execute()
+
+        return f"{PLATFORM_URL}/timelines/{new_tl_id}"
+
+
+# ── dialog ────────────────────────────────────────────────────────────────────
 
 class PublishDialog:
     """
-    Modal dialog that collects credentials + metadata, generates the PDF,
-    and publishes it to TimelineHub.
+    Modal dialog that collects credentials + metadata then publishes
+    structured timeline data to TimelineHub.
 
     Parameters
     ----------
-    parent           : tk widget (owner window)
-    timeline_title   : pre-filled title string
-    generate_pdf_fn  : callable(path: str) -> None
-                       Called with a file path where the PDF should be written.
-                       Must block until the PDF is fully written.
+    parent          : tk widget (owner window)
+    timeline_title  : pre-filled title string
+    db              : TimelineDB instance
     """
 
-    def __init__(self, parent, timeline_title: str, generate_pdf_fn):
-        self._parent          = parent
-        self._timeline_title  = timeline_title
-        self._generate_pdf_fn = generate_pdf_fn
-        self._publisher       = TimelineHubPublisher()
+    def __init__(self, parent, timeline_title: str, db):
+        self._parent         = parent
+        self._timeline_title = timeline_title
+        self._db             = db
+        self._publisher      = TimelineHubPublisher()
         self._build()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -113,7 +256,7 @@ class PublishDialog:
 
         pad = {"padx": 10, "pady": 4}
 
-        # ── Sign-in section ──────────────────────────────────────────────────
+        # ── sign-in section ──────────────────────────────────────────────────
         sign_frame = ttk.LabelFrame(win, text="TimelineHub Account", padding=8)
         sign_frame.pack(fill=tk.X, padx=12, pady=(12, 4))
 
@@ -132,7 +275,7 @@ class PublishDialog:
                         variable=self._remember_var).grid(
             row=2, column=1, sticky=tk.W, padx=10)
 
-        # ── Metadata section ─────────────────────────────────────────────────
+        # ── metadata section ─────────────────────────────────────────────────
         meta_frame = ttk.LabelFrame(win, text="Timeline Details", padding=8)
         meta_frame.pack(fill=tk.X, padx=12, pady=4)
 
@@ -152,16 +295,16 @@ class PublishDialog:
                      values=CATEGORIES, state="readonly", width=20).grid(
             row=2, column=1, sticky=tk.W, **pad)
 
-        # ── Status / progress ────────────────────────────────────────────────
+        # ── status / progress ────────────────────────────────────────────────
         self._status_var = tk.StringVar()
-        self._status_lbl = ttk.Label(win, textvariable=self._status_var,
-                                     foreground="#555", font=("Arial", 8))
-        self._status_lbl.pack(padx=12, pady=(4, 0), anchor=tk.W)
+        ttk.Label(win, textvariable=self._status_var,
+                  foreground="#555", font=("Arial", 8)).pack(
+            padx=12, pady=(4, 0), anchor=tk.W)
 
         self._progress = ttk.Progressbar(win, mode="indeterminate", length=340)
         self._progress.pack(padx=12, pady=(2, 6), fill=tk.X)
 
-        # ── Buttons ──────────────────────────────────────────────────────────
+        # ── buttons ──────────────────────────────────────────────────────────
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
 
@@ -172,17 +315,15 @@ class PublishDialog:
                    command=win.destroy).pack(side=tk.RIGHT)
 
         win.update_idletasks()
-        # Centre over parent
         px = self._parent.winfo_rootx() + self._parent.winfo_width()  // 2
         py = self._parent.winfo_rooty() + self._parent.winfo_height() // 2
         w, h = win.winfo_width(), win.winfo_height()
         win.geometry(f"+{px - w // 2}+{py - h // 2}")
 
-    # ── Publish flow ──────────────────────────────────────────────────────────
+    # ── publish flow ──────────────────────────────────────────────────────────
 
     def _set_busy(self, busy: bool):
-        state = tk.DISABLED if busy else tk.NORMAL
-        self._publish_btn.config(state=state)
+        self._publish_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
         if busy:
             self._progress.start(12)
         else:
@@ -218,48 +359,22 @@ class PublishDialog:
                          daemon=True).start()
 
     def _run_publish(self, email, password, title, desc, category):
-        tmp_path = None
         try:
-            # Step 1: sign in
-            self._status_var.set("Signing in…")
+            self._set_status("Signing in…")
             self._publisher.sign_in(email, password)
 
-            # Step 2: generate PDF to a temp file
-            self._status_var.set("Generating PDF…")
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
-            os.close(tmp_fd)
-            # generate_pdf_fn must run on the main thread (Tkinter / ImageGrab)
-            done_event = threading.Event()
-            error_box  = [None]
+            live_url = self._publisher.publish(
+                self._db, title, desc, category,
+                status_cb=self._set_status,
+            )
 
-            def _gen():
-                try:
-                    self._generate_pdf_fn(tmp_path)
-                except Exception as exc:
-                    error_box[0] = exc
-                finally:
-                    done_event.set()
-
-            self._win.after(0, _gen)
-            done_event.wait()
-            if error_box[0]:
-                raise error_box[0]
-
-            # Step 3: upload
-            self._status_var.set("Uploading to TimelineHub…")
-            live_url = self._publisher.publish(tmp_path, title, desc, category)
-
-            # Step 4: done
             self._win.after(0, self._on_success, live_url)
 
         except Exception as exc:
             self._win.after(0, self._on_error, exc)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+
+    def _set_status(self, msg: str):
+        self._win.after(0, lambda: self._status_var.set(msg))
 
     def _on_success(self, live_url: str):
         self._set_busy(False)
@@ -271,14 +386,15 @@ class PublishDialog:
         self._set_busy(False)
         self._status_var.set("")
         msg = str(exc)
-        # Surface a friendly message for common auth failures
         if "invalid" in msg.lower() or "credentials" in msg.lower() or "401" in msg:
             msg = "Invalid email or password. Please try again."
         messagebox.showerror("Publish Failed", msg, parent=self._win)
 
 
+# ── success dialog ────────────────────────────────────────────────────────────
+
 class _SuccessDialog:
-    """Small dialog showing the live URL with a 'Open in browser' button."""
+    """Small dialog showing the live URL with an 'Open in browser' button."""
 
     def __init__(self, parent, url: str):
         import webbrowser
@@ -290,7 +406,7 @@ class _SuccessDialog:
         ttk.Label(win, text="Your timeline is live at:", font=("Arial", 10)).pack(
             padx=16, pady=(14, 4))
 
-        url_var = tk.StringVar(value=url)
+        url_var   = tk.StringVar(value=url)
         url_entry = ttk.Entry(win, textvariable=url_var, width=54, state="readonly")
         url_entry.pack(padx=16, pady=4)
         url_entry.bind("<Button-1>", lambda _: (url_entry.config(state="normal"),
@@ -311,8 +427,9 @@ class _SuccessDialog:
         win.geometry(f"+{px - w // 2}+{py - h // 2}")
 
 
+# ── package check ─────────────────────────────────────────────────────────────
+
 def check_supabase_installed() -> bool:
-    """Return True if the supabase package is importable."""
     try:
         import supabase  # noqa: F401
         return True
