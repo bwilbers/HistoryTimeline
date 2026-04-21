@@ -73,6 +73,11 @@ class TimelineHubPublisher:
         self._client  = create_client(SUPABASE_URL, SUPABASE_KEY)
         resp = self._client.auth.sign_in_with_password({"email": email, "password": password})
         self._user_id = resp.user.id
+        # Explicitly apply the session so all subsequent table/storage calls
+        # carry the user's JWT and satisfy RLS policies.
+        self._client.auth.set_session(
+            resp.session.access_token, resp.session.refresh_token
+        )
 
     def publish(self, db, title: str, description: str, browse_category: str,
                 status_cb=None) -> str:
