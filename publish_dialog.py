@@ -10,6 +10,7 @@ import threading
 import os
 import io
 import json
+import tempfile
 
 SUPABASE_URL    = "https://tbpjthbywlgbxokfhhji.supabase.co"
 SUPABASE_KEY    = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
@@ -51,12 +52,29 @@ def _content_type(filename: str) -> str:
     }.get(ext, "image/png")
 
 
-def _upload_image(storage, path: str, blob: bytes, filename: str):
-    """Upload (or overwrite) blob in storage and return its public URL."""
-    storage.from_(_STORAGE_BUCKET).upload(
-        path, bytes(blob),
-        {"content-type": _content_type(filename), "upsert": "true"},
-    )
+def _upload_image(storage, path: str, blob, filename: str):
+    """Upload (or overwrite) blob in storage and return its public URL.
+
+    Writes to a temp file first so the SDK receives a file path,
+    which works across all supabase-py/storage3 versions.
+    """
+    suffix = os.path.splitext(filename or ".png")[1] or ".png"
+    fd, tmp_path = None, None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        data = bytes(blob) if not isinstance(blob, (bytes, bytearray)) else blob
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        fd = None  # fdopen took ownership; don't close again
+        storage.from_(_STORAGE_BUCKET).upload(
+            path, tmp_path,
+            {"content-type": _content_type(filename), "upsert": "true"},
+        )
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
     return storage.from_(_STORAGE_BUCKET).get_public_url(path)
 
 
