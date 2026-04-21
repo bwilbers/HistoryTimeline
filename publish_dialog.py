@@ -54,7 +54,7 @@ def _content_type(filename: str) -> str:
 def _upload_image(storage, path: str, blob: bytes, filename: str):
     """Upload (or overwrite) blob in storage and return its public URL."""
     storage.from_(_STORAGE_BUCKET).upload(
-        path, io.BytesIO(blob),
+        path, bytes(blob),
         {"content-type": _content_type(filename), "upsert": "true"},
     )
     return storage.from_(_STORAGE_BUCKET).get_public_url(path)
